@@ -1,5 +1,13 @@
 import type { Metadata } from "next";
+import { Bebas_Neue } from "next/font/google";
 import "./globals.css";
+
+const bebasNeue = Bebas_Neue({
+  subsets: ["latin"],
+  weight: "400",
+  display: "swap",
+  variable: "--font-bebas-neue",
+});
 
 export const metadata: Metadata = {
   title: "Taskflow — Your personal task list",
@@ -9,7 +17,7 @@ export const metadata: Metadata = {
 export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body className={`${bebasNeue.variable} antialiased`}>{children}</body>
     </html>
   );
 }
