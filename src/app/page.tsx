@@ -1,6 +1,12 @@
 "use client";
 
-import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import type { FormEvent } from "react";
 import Link from "next/link";
 import { TaskEditDialog } from "./task-edit-dialog";
@@ -21,6 +27,56 @@ type UserProfile = {
 type AuthResponse = {
   accessToken: string;
   user: UserProfile;
+};
+
+type Workspace = {
+  id: number;
+  name: string;
+  ownerId: number;
+  role: "owner" | "admin" | "member";
+};
+
+type WorkspaceMember = {
+  userId: number;
+  username: string;
+  email: string;
+  role: "owner" | "admin" | "member";
+};
+
+type SavedView = {
+  id: number;
+  name: string;
+  filters: {
+    filter?: TaskFilter;
+    dueFilter?: DueFilter;
+    priorityFilter?: TaskPriority | "any";
+    projectFilter?: string;
+    labelFilter?: string;
+    sort?: TaskSort;
+    search?: string;
+  };
+};
+
+type NotificationSettings = {
+  timezone: string;
+  reminderTime: string;
+  channels: Array<"email" | "push">;
+  pushEnabled: boolean;
+  publicKey: string | null;
+};
+
+type TaskComment = {
+  id: number;
+  content: string;
+  username: string;
+  createdAt: string;
+};
+
+type TaskActivity = {
+  id: number;
+  action: string;
+  username: string;
+  createdAt: string;
 };
 
 type TaskFilter = "all" | "active" | "completed";
@@ -47,6 +103,8 @@ const API_BASE_URL = (
   process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3000"
 ).replace(/\/$/, "");
 const SESSION_KEY = "task-api-session";
+const OFFLINE_CACHE_PREFIX = "taskflow-tasks:";
+const OFFLINE_QUEUE_PREFIX = "taskflow-queue:";
 let sessionSnapshot: AuthResponse | null = null;
 let sessionLoaded = false;
 const sessionListeners = new Set<() => void>();
@@ -138,31 +196,475 @@ async function apiRequest<T>(
     method?: string;
     token?: string;
     body?: unknown;
+    allowOffline?: boolean;
   } = {},
 ): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}${path}`, {
-    method: options.method ?? "GET",
-    headers: {
-      ...(options.body === undefined ? {} : { "Content-Type": "application/json" }),
-      ...(options.token ? { Authorization: `Bearer ${options.token}` } : {}),
-    },
-    ...(options.body === undefined
-      ? {}
-      : { body: JSON.stringify(options.body) }),
-  });
-  const contentType = response.headers.get("content-type");
-  const body: unknown = contentType?.includes("application/json")
-    ? await response.json()
-    : await response.text();
+  const method = options.method ?? "GET";
+  const taskRequest = path.startsWith("/tasks");
+  if (
+    taskRequest &&
+    options.allowOffline !== false &&
+    typeof navigator !== "undefined" &&
+    !navigator.onLine
+  ) {
+    return applyOfflineTaskRequest<T>(path, method, options.body);
+  }
+  const send = (token?: string) =>
+    fetch(`${API_BASE_URL}${path}`, {
+      method,
+      credentials: "include",
+      headers: {
+        ...(options.body === undefined
+          ? {}
+          : { "Content-Type": "application/json" }),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      ...(options.body === undefined
+        ? {}
+        : { body: JSON.stringify(options.body) }),
+    });
+  try {
+    let response = await send(options.token);
+    if (
+      response.status === 401 &&
+      options.token &&
+      !path.startsWith("/auth/")
+    ) {
+      try {
+        const refreshed = await fetch(`${API_BASE_URL}/auth/refresh`, {
+          method: "POST",
+          credentials: "include",
+        });
+        if (!refreshed.ok) {
+          throw new Error("Refresh session expired");
+        }
+        const nextSession: unknown = await refreshed.json();
+        if (!isAuthResponse(nextSession)) {
+          throw new Error("Invalid refresh response");
+        }
+        storeSession(nextSession);
+        response = await send(nextSession.accessToken);
+      } catch {
+        storeSession(null);
+      }
+    }
+    const contentType = response.headers.get("content-type");
+    const responseBody: unknown = contentType?.includes("application/json")
+      ? await response.json()
+      : await response.text();
 
-  if (!response.ok) {
-    throw new ApiRequestError(
-      getErrorMessage(body, `Request failed (${response.status})`),
-      response.status,
-    );
+    if (!response.ok) {
+      throw new ApiRequestError(
+        getErrorMessage(responseBody, `Request failed (${response.status})`),
+        response.status,
+      );
+    }
+
+    if (taskRequest && options.allowOffline !== false) {
+      cacheOnlineTaskResponse(path, method, options.body, responseBody);
+    }
+    return responseBody as T;
+  } catch (error) {
+    if (
+      taskRequest &&
+      options.allowOffline !== false &&
+      error instanceof TypeError
+    ) {
+      return applyOfflineTaskRequest<T>(path, method, options.body);
+    }
+    throw error;
+  }
+}
+
+type OfflineMutation = {
+  path: string;
+  method: string;
+  body?: unknown;
+  temporaryTaskId?: number;
+  temporarySubtaskId?: number;
+};
+
+function isTask(value: unknown): value is Task {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "id" in value &&
+    typeof value.id === "number" &&
+    "title" in value &&
+    typeof value.title === "string" &&
+    "subtasks" in value &&
+    Array.isArray(value.subtasks)
+  );
+}
+
+function offlineCacheKey(userId: number, workspaceId?: string | number): string {
+  return `${OFFLINE_CACHE_PREFIX}${userId}:${workspaceId ?? "personal"}`;
+}
+
+function offlineQueueKey(userId: number): string {
+  return `${OFFLINE_QUEUE_PREFIX}${userId}`;
+}
+
+function readTaskCache(key: string): Task[] | undefined {
+  const raw = window.localStorage.getItem(key);
+  if (!raw) {
+    return undefined;
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) && parsed.every(isTask)
+      ? parsed
+      : undefined;
+  } catch {
+    window.localStorage.removeItem(key);
+    return undefined;
+  }
+}
+
+function saveTaskCache(key: string, tasks: Task[]): void {
+  window.localStorage.setItem(key, JSON.stringify(tasks));
+}
+
+function readOfflineQueue(userId: number): OfflineMutation[] {
+  const raw = window.localStorage.getItem(offlineQueueKey(userId));
+  if (!raw) {
+    return [];
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as OfflineMutation[]) : [];
+  } catch {
+    window.localStorage.removeItem(offlineQueueKey(userId));
+    return [];
+  }
+}
+
+function writeOfflineQueue(userId: number, queue: OfflineMutation[]): void {
+  const key = offlineQueueKey(userId);
+  if (queue.length) {
+    window.localStorage.setItem(key, JSON.stringify(queue));
+  } else {
+    window.localStorage.removeItem(key);
+  }
+}
+
+function taskCacheEntries(userId: number): Array<[string, Task[]]> {
+  const entries: Array<[string, Task[]]> = [];
+  for (let index = 0; index < window.localStorage.length; index += 1) {
+    const key = window.localStorage.key(index);
+    if (!key?.startsWith(`${OFFLINE_CACHE_PREFIX}${userId}:`)) {
+      continue;
+    }
+    const tasks = readTaskCache(key);
+    if (tasks) {
+      entries.push([key, tasks]);
+    }
+  }
+  return entries;
+}
+
+function cacheOnlineTaskResponse(
+  path: string,
+  method: string,
+  requestBody: unknown,
+  responseBody: unknown,
+): void {
+  const userId = sessionSnapshot?.user.id;
+  if (!userId || typeof window === "undefined") {
+    return;
+  }
+  const parsedPath = new URL(path, window.location.origin);
+  if (parsedPath.pathname === "/tasks" && method === "GET") {
+    if (Array.isArray(responseBody) && responseBody.every(isTask)) {
+      saveTaskCache(
+        offlineCacheKey(userId, parsedPath.searchParams.get("workspaceId") ?? undefined),
+        responseBody,
+      );
+    }
+    return;
   }
 
-  return body as T;
+  if (method === "POST" && parsedPath.pathname === "/tasks" && isTask(responseBody)) {
+    const workspaceId =
+      typeof requestBody === "object" &&
+      requestBody !== null &&
+      "workspaceId" in requestBody &&
+      typeof requestBody.workspaceId === "number"
+        ? requestBody.workspaceId
+        : undefined;
+    const key = offlineCacheKey(userId, workspaceId);
+    const cached = readTaskCache(key) ?? [];
+    saveTaskCache(
+      key,
+      cached.some((task) => task.id === responseBody.id)
+        ? cached
+        : [...cached, responseBody],
+    );
+    return;
+  }
+
+  const taskMatch = parsedPath.pathname.match(/^\/tasks\/(-?\d+)/);
+  if (!taskMatch) {
+    return;
+  }
+  const taskId = Number(taskMatch[1]);
+  if (method === "DELETE" && parsedPath.pathname === `/tasks/${taskId}`) {
+    for (const [key, tasks] of taskCacheEntries(userId)) {
+      saveTaskCache(key, tasks.filter((task) => task.id !== taskId));
+    }
+    return;
+  }
+  if (!isTask(responseBody)) {
+    return;
+  }
+  for (const [key, tasks] of taskCacheEntries(userId)) {
+    if (tasks.some((task) => task.id === responseBody.id)) {
+      saveTaskCache(
+        key,
+        tasks.map((task) => (task.id === responseBody.id ? responseBody : task)),
+      );
+    }
+  }
+}
+
+function applyOfflineTaskRequest<T>(
+  path: string,
+  method: string,
+  requestBody: unknown,
+): T {
+  const userId = sessionSnapshot?.user.id;
+  if (!userId) {
+    throw new Error("Sign in before using offline task changes.");
+  }
+  const parsedPath = new URL(path, window.location.origin);
+  const isList = parsedPath.pathname === "/tasks";
+  const listKey = offlineCacheKey(
+    userId,
+    parsedPath.searchParams.get("workspaceId") ?? undefined,
+  );
+  const tasks = readTaskCache(listKey);
+  if (isList && method === "GET") {
+    if (!tasks) {
+      throw new Error("No cached tasks are available while offline.");
+    }
+    return tasks as T;
+  }
+
+  const queue = readOfflineQueue(userId);
+  if (isList && method === "POST") {
+    if (typeof requestBody !== "object" || requestBody === null || !("title" in requestBody)) {
+      throw new Error("Could not save this task offline.");
+    }
+    const temporaryTaskId = -Date.now() * 1000 - Math.floor(Math.random() * 1000);
+    const body = requestBody as Partial<Task>;
+    const task: Task = {
+      id: temporaryTaskId,
+      title: String(body.title),
+      ...(body.description ? { description: body.description } : {}),
+      completed: body.completed ?? false,
+      ownerId: userId,
+      ...(body.workspaceId ? { workspaceId: body.workspaceId } : {}),
+      ...(body.assigneeId ? { assigneeId: body.assigneeId } : {}),
+      ...(body.dueDate ? { dueDate: body.dueDate } : {}),
+      priority: body.priority ?? "medium",
+      ...(body.project ? { project: body.project } : {}),
+      labels: body.labels ?? [],
+      ...(body.recurrence ? { recurrence: body.recurrence } : {}),
+      subtasks: [],
+    };
+    const workspaceCache = offlineCacheKey(userId, body.workspaceId);
+    const current = readTaskCache(workspaceCache) ?? [];
+    saveTaskCache(workspaceCache, [...current, task]);
+    queue.push({
+      path: "/tasks",
+      method,
+      body: requestBody,
+      temporaryTaskId,
+    });
+    writeOfflineQueue(userId, queue);
+    return task as T;
+  }
+
+  const taskMatch = parsedPath.pathname.match(/^\/tasks\/(-?\d+)/);
+  const taskId = taskMatch ? Number(taskMatch[1]) : undefined;
+  const cacheEntry = taskId === undefined
+    ? undefined
+    : taskCacheEntries(userId).find(([, list]) => list.some((task) => task.id === taskId));
+  const task = cacheEntry?.[1].find((item) => item.id === taskId);
+  if (!task || !cacheEntry || taskId === undefined) {
+    throw new Error("This task is not available in the offline cache.");
+  }
+
+  if (parsedPath.pathname === `/tasks/${taskId}` && method === "PATCH") {
+    const changes =
+      typeof requestBody === "object" && requestBody !== null
+        ? (requestBody as Partial<Task>)
+        : {};
+    const updated = { ...task, ...changes };
+    saveTaskCache(
+      cacheEntry[0],
+      cacheEntry[1].map((item) => (item.id === taskId ? updated : item)),
+    );
+    queue.push({ path, method, body: requestBody });
+    writeOfflineQueue(userId, queue);
+    return updated as T;
+  }
+  if (parsedPath.pathname === `/tasks/${taskId}` && method === "DELETE") {
+    saveTaskCache(cacheEntry[0], cacheEntry[1].filter((item) => item.id !== taskId));
+    if (taskId < 0) {
+      writeOfflineQueue(
+        userId,
+        queue.filter(
+          (item) =>
+            item.temporaryTaskId !== taskId &&
+            !item.path.includes(`/tasks/${taskId}`),
+        ),
+      );
+    } else {
+      queue.push({ path, method });
+      writeOfflineQueue(userId, queue);
+    }
+    return task as T;
+  }
+
+  const createSubtask = parsedPath.pathname === `/tasks/${taskId}/subtasks`;
+  const subtaskMatch = parsedPath.pathname.match(
+    /^\/tasks\/-?\d+\/subtasks\/(-?\d+)$/,
+  );
+  if (createSubtask && method === "POST") {
+    const title =
+      typeof requestBody === "object" &&
+      requestBody !== null &&
+      "title" in requestBody
+        ? String(requestBody.title)
+        : "";
+    if (!title.trim()) {
+      throw new Error("A subtask title is required.");
+    }
+    const temporarySubtaskId = -Date.now() * 1000 - Math.floor(Math.random() * 1000);
+    const updated = {
+      ...task,
+      subtasks: [
+        ...task.subtasks,
+        { id: temporarySubtaskId, title: title.trim(), completed: false },
+      ],
+    };
+    saveTaskCache(
+      cacheEntry[0],
+      cacheEntry[1].map((item) => (item.id === taskId ? updated : item)),
+    );
+    queue.push({
+      path,
+      method,
+      body: requestBody,
+      temporarySubtaskId,
+      temporaryTaskId: taskId < 0 ? taskId : undefined,
+    });
+    writeOfflineQueue(userId, queue);
+    return updated as T;
+  }
+  if (subtaskMatch && (method === "PATCH" || method === "DELETE")) {
+    const subtaskId = Number(subtaskMatch[1]);
+    const subtask = task.subtasks.find((item) => item.id === subtaskId);
+    if (!subtask) {
+      throw new Error("This subtask is not available in the offline cache.");
+    }
+    const subtasks =
+      method === "DELETE"
+        ? task.subtasks.filter((item) => item.id !== subtaskId)
+        : task.subtasks.map((item) =>
+            item.id === subtaskId
+              ? { ...item, completed: Boolean((requestBody as { completed?: unknown }).completed) }
+              : item,
+          );
+    const updated = { ...task, subtasks };
+    saveTaskCache(
+      cacheEntry[0],
+      cacheEntry[1].map((item) => (item.id === taskId ? updated : item)),
+    );
+    if (taskId < 0 && subtaskId < 0 && method === "DELETE") {
+      writeOfflineQueue(
+        userId,
+        queue.filter((item) => item.temporarySubtaskId !== subtaskId),
+      );
+    } else {
+      queue.push({ path, method, body: requestBody });
+      writeOfflineQueue(userId, queue);
+    }
+    return updated as T;
+  }
+  throw new Error("This task change is not supported while offline.");
+}
+
+async function syncOfflineQueue(userId: number, token: string): Promise<void> {
+  const taskIds = new Map<number, number>();
+  const subtaskIds = new Map<string, number>();
+  let queue = readOfflineQueue(userId);
+
+  while (queue.length) {
+    const item = queue[0];
+    const originalTaskMatch = item.path.match(/^\/tasks\/(-?\d+)/);
+    const originalTaskId = originalTaskMatch
+      ? Number(originalTaskMatch[1])
+      : undefined;
+    let path = item.path;
+    if (originalTaskId !== undefined && originalTaskId < 0) {
+      const actualTaskId = taskIds.get(originalTaskId);
+      if (actualTaskId === undefined) {
+        throw new Error("Offline changes are out of order and cannot sync.");
+      }
+      path = path.replace(`/tasks/${originalTaskId}`, `/tasks/${actualTaskId}`);
+    }
+
+    const subtaskMatch = item.path.match(
+      /^\/tasks\/-?\d+\/subtasks\/(-?\d+)$/,
+    );
+    if (subtaskMatch && originalTaskId !== undefined) {
+      const temporarySubtaskId = Number(subtaskMatch[1]);
+      if (temporarySubtaskId < 0) {
+        const actualSubtaskId = subtaskIds.get(
+          `${originalTaskId}:${temporarySubtaskId}`,
+        );
+        if (actualSubtaskId === undefined) {
+          throw new Error("An offline subtask change cannot be matched.");
+        }
+        path = path.replace(
+          `/subtasks/${temporarySubtaskId}`,
+          `/subtasks/${actualSubtaskId}`,
+        );
+      }
+    }
+
+    const result = await apiRequest<unknown>(path, {
+      method: item.method,
+      token,
+      body: item.body,
+      allowOffline: false,
+    });
+    if (item.temporaryTaskId !== undefined && isTask(result)) {
+      taskIds.set(item.temporaryTaskId, result.id);
+    }
+    if (item.temporarySubtaskId !== undefined && isTask(result)) {
+      const title =
+        typeof item.body === "object" &&
+        item.body !== null &&
+        "title" in item.body
+          ? String(item.body.title)
+          : "";
+      const created = result.subtasks
+        .filter((subtask) => subtask.title === title)
+        .sort((left, right) => right.id - left.id)[0];
+      if (created && originalTaskId !== undefined) {
+        subtaskIds.set(
+          `${originalTaskId}:${item.temporarySubtaskId}`,
+          created.id,
+        );
+      }
+    }
+
+    queue = queue.slice(1);
+    writeOfflineQueue(userId, queue);
+  }
 }
 
 function getInitials(username: string): string {
@@ -179,6 +681,31 @@ function getLocalDateKey(date = new Date()): string {
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+function getWeekDateKeys(today: string, offset: number): string[] {
+  if (!today) {
+    return [];
+  }
+  const [year, month, day] = today.split("-").map(Number);
+  const start = new Date(year, month - 1, day);
+  start.setHours(0, 0, 0, 0);
+  start.setDate(start.getDate() - ((start.getDay() + 6) % 7) + offset * 7);
+  return Array.from({ length: 7 }, (_, index) => {
+    const date = new Date(start);
+    date.setDate(start.getDate() + index);
+    return getLocalDateKey(date);
+  });
+}
+
+function decodeVapidKey(value: string): Uint8Array<ArrayBuffer> {
+  const base64 = value.replace(/-/g, "+").replace(/_/g, "/");
+  const raw = window.atob(base64);
+  const result = new Uint8Array(raw.length);
+  for (let index = 0; index < raw.length; index += 1) {
+    result[index] = raw.charCodeAt(index);
+  }
+  return result;
 }
 
 function getClientDateKey(): string {
@@ -228,6 +755,7 @@ export default function Home() {
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState("");
   const [taskError, setTaskError] = useState("");
+  const [taskNotice, setTaskNotice] = useState("");
   const [tasks, setTasks] = useState<Task[]>([]);
   const [tasksLoading, setTasksLoading] = useState(true);
   const [taskBusyId, setTaskBusyId] = useState<number | null>(null);
@@ -242,6 +770,36 @@ export default function Home() {
   const [sort, setSort] = useState<TaskSort>("newest");
   const [search, setSearch] = useState("");
   const [editingTask, setEditingTask] = useState<Task | null>(null);
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [workspaceId, setWorkspaceId] = useState<number | null>(null);
+  const [workspaceMembers, setWorkspaceMembers] = useState<WorkspaceMember[]>([]);
+  const [workspaceName, setWorkspaceName] = useState("");
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [savedViews, setSavedViews] = useState<SavedView[]>([]);
+  const [savedViewName, setSavedViewName] = useState("");
+  const [selectedSavedViewId, setSelectedSavedViewId] = useState("");
+  const [weekView, setWeekView] = useState(false);
+  const [weekOffset, setWeekOffset] = useState(0);
+  const [discussionTaskId, setDiscussionTaskId] = useState<number | null>(null);
+  const [taskComments, setTaskComments] = useState<TaskComment[]>([]);
+  const [taskActivity, setTaskActivity] = useState<TaskActivity[]>([]);
+  const [commentText, setCommentText] = useState("");
+  const [notificationSettings, setNotificationSettings] =
+    useState<NotificationSettings | null>(null);
+  const [reminders, setReminders] = useState<Array<{
+    id: number;
+    taskTitle: string;
+    channel: string;
+    sentAt: string | null;
+  }>>([]);
+  const [notificationTime, setNotificationTime] = useState("09:00");
+  const [notificationTimezone, setNotificationTimezone] = useState("UTC");
+  const [notificationChannels, setNotificationChannels] = useState<
+    Array<"email" | "push">
+  >(["email"]);
+  const [isOnline, setIsOnline] = useState(true);
+  const [pendingOfflineCount, setPendingOfflineCount] = useState(0);
+  const syncingOffline = useRef(false);
   const today = useSyncExternalStore(
     subscribeToDate,
     getClientDateKey,
@@ -254,7 +812,10 @@ export default function Home() {
     }
 
     let active = true;
-    apiRequest<Task[]>("/tasks", { token: session.accessToken })
+    const taskPath = workspaceId
+      ? `/tasks?workspaceId=${workspaceId}`
+      : "/tasks";
+    apiRequest<Task[]>(taskPath, { token: session.accessToken })
       .then((loadedTasks) => {
         if (active) {
           setTasks(loadedTasks);
@@ -283,7 +844,171 @@ export default function Home() {
     return () => {
       active = false;
     };
+  }, [session, workspaceId]);
+
+  useEffect(() => {
+    if (!session) {
+      return;
+    }
+    let active = true;
+    Promise.all([
+      apiRequest<Workspace[]>("/workspaces", { token: session.accessToken }),
+      apiRequest<SavedView[]>("/saved-views", { token: session.accessToken }),
+      apiRequest<NotificationSettings>("/notifications/settings", {
+        token: session.accessToken,
+      }),
+      apiRequest<typeof reminders>("/notifications", {
+        token: session.accessToken,
+      }),
+    ])
+      .then(([loadedWorkspaces, loadedViews, settings, loadedReminders]) => {
+        if (!active) {
+          return;
+        }
+        setWorkspaces(loadedWorkspaces);
+        setSavedViews(loadedViews);
+        setNotificationSettings(settings);
+        setNotificationTime(settings.reminderTime);
+        setNotificationTimezone(settings.timezone);
+        setNotificationChannels(settings.channels);
+        setReminders(loadedReminders);
+      })
+      .catch((error: unknown) => {
+        if (active) {
+          setTaskError(
+            error instanceof Error
+              ? error.message
+              : "Could not load your account settings.",
+          );
+        }
+      });
+    return () => {
+      active = false;
+    };
   }, [session]);
+
+  useEffect(() => {
+    if (!session) {
+      return;
+    }
+    const token = window.sessionStorage.getItem("taskflow-pending-invite");
+    if (!token) {
+      return;
+    }
+    window.sessionStorage.removeItem("taskflow-pending-invite");
+    apiRequest<Workspace>("/workspaces/accept-invitation", {
+      method: "POST",
+      token: session.accessToken,
+      body: { token },
+    })
+      .then(async (workspace) => {
+        setWorkspaces(
+          await apiRequest<Workspace[]>("/workspaces", {
+            token: session.accessToken,
+          }),
+        );
+        setWorkspaceId(workspace.id);
+        setTasksLoading(true);
+        setTaskNotice(`You joined ${workspace.name}.`);
+      })
+      .catch((error: unknown) => {
+        window.sessionStorage.setItem("taskflow-pending-invite", token);
+        setTaskError(
+          error instanceof Error
+            ? error.message
+            : "Could not accept the workspace invitation.",
+        );
+      });
+  }, [session]);
+
+  useEffect(() => {
+    if (!session || !workspaceId) {
+      return;
+    }
+    let active = true;
+    apiRequest<WorkspaceMember[]>(`/workspaces/${workspaceId}/members`, {
+      token: session.accessToken,
+    })
+      .then((members) => {
+        if (active) {
+          setWorkspaceMembers(members);
+        }
+      })
+      .catch((error: unknown) => {
+        if (active) {
+          setTaskError(
+            error instanceof Error
+              ? error.message
+              : "Could not load workspace members.",
+          );
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [session, workspaceId]);
+
+  useEffect(() => {
+    if (!session) {
+      return;
+    }
+    const refreshOfflineStatus = () => {
+      setIsOnline(navigator.onLine);
+      setPendingOfflineCount(readOfflineQueue(session.user.id).length);
+    };
+    const sync = () => {
+      refreshOfflineStatus();
+      if (!navigator.onLine || syncingOffline.current) {
+        return;
+      }
+      syncingOffline.current = true;
+      void syncOfflineQueue(session.user.id, session.accessToken)
+        .then(async () => {
+          const taskPath = workspaceId
+            ? `/tasks?workspaceId=${workspaceId}`
+            : "/tasks";
+          setTasks(await apiRequest<Task[]>(taskPath, {
+            token: session.accessToken,
+            allowOffline: false,
+          }));
+          refreshOfflineStatus();
+        })
+        .catch((error: unknown) => {
+          setTaskError(
+            error instanceof Error
+              ? `Offline changes could not sync: ${error.message}`
+              : "Offline changes could not sync.",
+          );
+        })
+        .finally(() => {
+          syncingOffline.current = false;
+          refreshOfflineStatus();
+        });
+    };
+    const online = () => sync();
+    const offline = () => refreshOfflineStatus();
+    refreshOfflineStatus();
+    window.addEventListener("online", online);
+    window.addEventListener("offline", offline);
+    sync();
+    return () => {
+      window.removeEventListener("online", online);
+      window.removeEventListener("offline", offline);
+    };
+  }, [session, workspaceId]);
+
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) {
+      return;
+    }
+    void navigator.serviceWorker.register("/sw.js").catch((error: unknown) => {
+      setTaskError(
+        error instanceof Error
+          ? `Offline app setup failed: ${error.message}`
+          : "Offline app setup failed.",
+      );
+    });
+  }, []);
 
   const projectNames = useMemo(
     () =>
@@ -388,6 +1113,263 @@ export default function Home() {
   const dueTodayCount = tasks.filter(
     (task) => !task.completed && task.dueDate === today,
   ).length;
+  const weekDates = useMemo(
+    () => getWeekDateKeys(today, weekOffset),
+    [today, weekOffset],
+  );
+  const selectedWorkspace = workspaces.find(
+    (workspace) => workspace.id === workspaceId,
+  );
+
+  async function handleCreateWorkspace(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!session) {
+      return;
+    }
+    try {
+      const workspace = await apiRequest<Workspace>("/workspaces", {
+        method: "POST",
+        token: session.accessToken,
+        body: { name: workspaceName },
+      });
+      setWorkspaces((current) => [...current, workspace]);
+      setTasksLoading(true);
+      setWorkspaceId(workspace.id);
+      setWorkspaceName("");
+      setTaskNotice(`Created ${workspace.name}.`);
+    } catch (error) {
+      setTaskError(
+        error instanceof Error ? error.message : "Could not create workspace.",
+      );
+    }
+  }
+
+  async function handleInviteMember(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!session || !workspaceId) {
+      return;
+    }
+    try {
+      await apiRequest(`/workspaces/${workspaceId}/invitations`, {
+        method: "POST",
+        token: session.accessToken,
+        body: {
+          email: inviteEmail,
+          role: String(new FormData(event.currentTarget).get("role") ?? "member"),
+        },
+      });
+      setInviteEmail("");
+      setTaskNotice("Invitation sent.");
+    } catch (error) {
+      setTaskError(
+        error instanceof Error ? error.message : "Could not send invitation.",
+      );
+    }
+  }
+
+  async function saveCurrentView(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!session) {
+      return;
+    }
+    try {
+      const view = await apiRequest<SavedView>("/saved-views", {
+        method: "POST",
+        token: session.accessToken,
+        body: {
+          name: savedViewName,
+          filters: {
+            filter,
+            dueFilter,
+            priorityFilter,
+            projectFilter,
+            labelFilter,
+            sort,
+            search,
+          },
+        },
+      });
+      setSavedViews((current) => [...current, view]);
+      setSelectedSavedViewId(String(view.id));
+      setSavedViewName("");
+    } catch (error) {
+      setTaskError(
+        error instanceof Error ? error.message : "Could not save this view.",
+      );
+    }
+  }
+
+  function applySavedView(id: string) {
+    setSelectedSavedViewId(id);
+    const view = savedViews.find((item) => String(item.id) === id);
+    if (!view) {
+      return;
+    }
+    setFilter(view.filters.filter ?? "all");
+    setDueFilter(view.filters.dueFilter ?? "any");
+    setPriorityFilter(view.filters.priorityFilter ?? "any");
+    setProjectFilter(view.filters.projectFilter ?? "any");
+    setLabelFilter(view.filters.labelFilter ?? "any");
+    setSort(view.filters.sort ?? "newest");
+    setSearch(view.filters.search ?? "");
+  }
+
+  async function deleteSavedView() {
+    if (!session || !selectedSavedViewId) {
+      return;
+    }
+    try {
+      await apiRequest(`/saved-views/${selectedSavedViewId}`, {
+        method: "DELETE",
+        token: session.accessToken,
+      });
+      setSavedViews((current) =>
+        current.filter((view) => String(view.id) !== selectedSavedViewId),
+      );
+      setSelectedSavedViewId("");
+    } catch (error) {
+      setTaskError(
+        error instanceof Error ? error.message : "Could not delete saved view.",
+      );
+    }
+  }
+
+  async function toggleDiscussion(taskId: number) {
+    if (!session) {
+      return;
+    }
+    if (discussionTaskId === taskId) {
+      setDiscussionTaskId(null);
+      return;
+    }
+    setDiscussionTaskId(taskId);
+    try {
+      const [comments, activity] = await Promise.all([
+        apiRequest<TaskComment[]>(`/tasks/${taskId}/comments`, {
+          token: session.accessToken,
+        }),
+        apiRequest<TaskActivity[]>(`/tasks/${taskId}/activity`, {
+          token: session.accessToken,
+        }),
+      ]);
+      setTaskComments(comments);
+      setTaskActivity(activity);
+    } catch (error) {
+      setTaskError(
+        error instanceof Error
+          ? error.message
+          : "Could not load task comments.",
+      );
+      setDiscussionTaskId(null);
+    }
+  }
+
+  async function addTaskComment(
+    taskId: number,
+    event: FormEvent<HTMLFormElement>,
+  ) {
+    event.preventDefault();
+    if (!session || !commentText.trim()) {
+      return;
+    }
+    try {
+      const comment = await apiRequest<TaskComment>(
+        `/tasks/${taskId}/comments`,
+        {
+          method: "POST",
+          token: session.accessToken,
+          body: { content: commentText },
+        },
+      );
+      setTaskComments((current) => [...current, comment]);
+      setTaskActivity((current) => [
+        {
+          id: -Date.now(),
+          action: "comment.created",
+          username: session.user.username,
+          createdAt: new Date().toISOString(),
+        },
+        ...current,
+      ]);
+      setCommentText("");
+    } catch (error) {
+      setTaskError(
+        error instanceof Error ? error.message : "Could not add comment.",
+      );
+    }
+  }
+
+  async function saveNotificationSettings(
+    event: FormEvent<HTMLFormElement>,
+  ) {
+    event.preventDefault();
+    if (!session) {
+      return;
+    }
+    try {
+      const settings = await apiRequest<NotificationSettings>(
+        "/notifications/settings",
+        {
+          method: "PATCH",
+          token: session.accessToken,
+          body: {
+            timezone: notificationTimezone,
+            reminderTime: notificationTime,
+            channels: notificationChannels,
+          },
+        },
+      );
+      setNotificationSettings(settings);
+      setTaskNotice("Reminder settings saved.");
+    } catch (error) {
+      setTaskError(
+        error instanceof Error
+          ? error.message
+          : "Could not save reminder settings.",
+      );
+    }
+  }
+
+  async function enablePushNotifications() {
+    if (!session || !notificationSettings?.publicKey) {
+      setTaskError("Web push is not configured for this app.");
+      return;
+    }
+    if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
+      setTaskError("This browser does not support web push notifications.");
+      return;
+    }
+    try {
+      const permission = await Notification.requestPermission();
+      if (permission !== "granted") {
+        throw new Error("Allow notifications in your browser to continue.");
+      }
+      const registration = await navigator.serviceWorker.ready;
+      const subscription = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: decodeVapidKey(notificationSettings.publicKey),
+      });
+      const serialized = subscription.toJSON();
+      if (!serialized.endpoint || !serialized.keys?.p256dh || !serialized.keys.auth) {
+        throw new Error("The browser returned an incomplete push subscription.");
+      }
+      await apiRequest("/notifications/push-subscriptions", {
+        method: "POST",
+        token: session.accessToken,
+        body: {
+          endpoint: serialized.endpoint,
+          keys: serialized.keys,
+        },
+      });
+      setTaskNotice("Push notifications enabled.");
+    } catch (error) {
+      setTaskError(
+        error instanceof Error
+          ? error.message
+          : "Could not enable push notifications.",
+      );
+    }
+  }
 
   async function handleAuthSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -427,10 +1409,23 @@ export default function Home() {
     }
   }
 
-  function signOut() {
+  async function signOut() {
+    try {
+      await apiRequest<void>("/auth/logout", { method: "POST" });
+    } catch (error) {
+      setTaskError(
+        error instanceof Error ? error.message : "Could not revoke the session.",
+      );
+    }
     storeSession(null);
     setTasks([]);
     setTasksLoading(false);
+    setWorkspaces([]);
+    setWorkspaceMembers([]);
+    setWorkspaceId(null);
+    setSavedViews([]);
+    setReminders([]);
+    setNotificationSettings(null);
     setSearch("");
     setFilter("all");
     setDueFilter("any");
@@ -482,6 +1477,14 @@ export default function Home() {
           ...(dueDate ? { dueDate } : {}),
           ...(project ? { project } : {}),
           ...(recurrence ? { recurrence } : {}),
+          ...(workspaceId
+            ? {
+                workspaceId,
+                ...(form.get("assigneeId")
+                  ? { assigneeId: Number(form.get("assigneeId")) }
+                  : {}),
+              }
+            : {}),
         },
       });
       setTasks((current) => [...current, task]);
@@ -510,9 +1513,12 @@ export default function Home() {
       });
       if (!task.completed && updatedTask.completed && task.recurrence) {
         setTasks(
-          await apiRequest<Task[]>("/tasks", {
+          await apiRequest<Task[]>(
+            workspaceId ? `/tasks?workspaceId=${workspaceId}` : "/tasks",
+            {
             token: session.accessToken,
-          }),
+            },
+          ),
         );
       } else {
         setTasks((current) =>
@@ -773,6 +1779,11 @@ export default function Home() {
                   required
                 />
               </label>
+              {authMode === "login" && (
+                <Link className="auth-link" href="/forgot-password">
+                  Forgot your password?
+                </Link>
+              )}
               <label className="field">
                 <span>Password</span>
                 <input
@@ -838,14 +1849,40 @@ export default function Home() {
         </Link>
 
         <div className="workspace-label">WORKSPACE</div>
-        <div className="workspace-switcher">
-          <span className="workspace-icon">P</span>
-          <span className="workspace-name">
-            Personal space
-            <small>Free plan</small>
-          </span>
-          <span className="chevron" aria-hidden="true">⌄</span>
-        </div>
+        <label className="workspace-select-label">
+          <span className="sr-only">Choose a workspace</span>
+          <select
+            className="workspace-select"
+            onChange={(event) =>
+              {
+                setWorkspaceMembers([]);
+                setTasksLoading(true);
+                setWorkspaceId(
+                  event.target.value ? Number(event.target.value) : null,
+                );
+              }
+            }
+            value={workspaceId ?? ""}
+          >
+            <option value="">Personal space</option>
+            {workspaces.map((workspace) => (
+              <option key={workspace.id} value={workspace.id}>
+                {workspace.name} · {workspace.role}
+              </option>
+            ))}
+          </select>
+        </label>
+        <form className="workspace-create-form" onSubmit={handleCreateWorkspace}>
+          <input
+            aria-label="New workspace name"
+            maxLength={80}
+            onChange={(event) => setWorkspaceName(event.target.value)}
+            placeholder="New workspace..."
+            required
+            value={workspaceName}
+          />
+          <button aria-label="Create workspace" type="submit">+</button>
+        </form>
 
         <nav className="side-nav" aria-label="Main navigation">
           <span className="nav-section-label">OVERVIEW</span>
@@ -891,8 +1928,13 @@ export default function Home() {
           <div className="topbar-right">
             <span className="today-label">
               <span className="calendar-icon" aria-hidden="true">▦</span>
-              Your personal task list
+              {isOnline ? "Online" : "Offline · changes saved on this device"}
             </span>
+            {pendingOfflineCount > 0 && (
+              <span className="offline-count">
+                {pendingOfflineCount} pending
+              </span>
+            )}
             <span className="top-avatar">{getInitials(session.user.username)}</span>
           </div>
         </header>
@@ -901,14 +1943,50 @@ export default function Home() {
           <div className="page-intro">
             <div>
               <div className="eyebrow">YOUR SPACE, YOUR PACE</div>
-              <h1>My tasks<span className="title-period">.</span></h1>
-              <p>A clear mind starts with a clear list.</p>
+              <h1>{selectedWorkspace?.name ?? "My tasks"}<span className="title-period">.</span></h1>
+              <p>
+                {selectedWorkspace
+                  ? `Shared space · ${selectedWorkspace.role}`
+                  : "A clear mind starts with a clear list."}
+              </p>
             </div>
             <div className="date-stamp">
               <span className="date-dot" />
-              <span>PRIVATE WORKSPACE</span>
+              <span>{selectedWorkspace ? "TEAM WORKSPACE" : "PRIVATE WORKSPACE"}</span>
             </div>
           </div>
+
+          {selectedWorkspace &&
+            (selectedWorkspace.role === "owner" ||
+              selectedWorkspace.role === "admin") && (
+              <form className="invite-form" onSubmit={handleInviteMember}>
+                <label>
+                  <span>Invite a teammate</span>
+                  <input
+                    autoComplete="email"
+                    maxLength={254}
+                    onChange={(event) => setInviteEmail(event.target.value)}
+                    placeholder="teammate@example.com"
+                    required
+                    type="email"
+                    value={inviteEmail}
+                  />
+                </label>
+                <label>
+                  <span>Role</span>
+                  <select defaultValue="member" name="role">
+                    <option value="member">Member</option>
+                    <option value="admin">Admin</option>
+                  </select>
+                </label>
+                <button className="button button-primary" type="submit">
+                  Send invite
+                </button>
+                <small>
+                  Invitees need a Taskflow account before joining.
+                </small>
+              </form>
+            )}
 
           <section className="stats-grid" aria-label="Task summary">
             <article className="stat-card stat-card-total">
@@ -935,6 +2013,101 @@ export default function Home() {
               </div>
               <span className="stat-foot">nice work</span>
             </article>
+          </section>
+
+          <section className="feature-panel">
+            <details>
+              <summary>Reminders &amp; notifications</summary>
+              {notificationSettings ? (
+                <>
+                  <form
+                    className="notification-settings"
+                    onSubmit={saveNotificationSettings}
+                  >
+                    <label>
+                      <span>Reminder time</span>
+                      <input
+                        onChange={(event) => setNotificationTime(event.target.value)}
+                        type="time"
+                        value={notificationTime}
+                      />
+                    </label>
+                    <label>
+                      <span>Time zone</span>
+                      <input
+                        maxLength={80}
+                        onChange={(event) =>
+                          setNotificationTimezone(event.target.value)
+                        }
+                        value={notificationTimezone}
+                      />
+                    </label>
+                    <label className="checkbox-field">
+                      <input
+                        checked={notificationChannels.includes("email")}
+                        onChange={(event) =>
+                          setNotificationChannels((current) =>
+                            event.target.checked
+                              ? current.includes("email")
+                                ? current
+                                : [...current, "email"]
+                              : current.filter((channel) => channel !== "email"),
+                          )
+                        }
+                        type="checkbox"
+                      />
+                      Email
+                    </label>
+                    <label className="checkbox-field">
+                      <input
+                        checked={notificationChannels.includes("push")}
+                        disabled={!notificationSettings.pushEnabled}
+                        onChange={(event) =>
+                          setNotificationChannels((current) =>
+                            event.target.checked
+                              ? current.includes("push")
+                                ? current
+                                : [...current, "push"]
+                              : current.filter((channel) => channel !== "push"),
+                          )
+                        }
+                        type="checkbox"
+                      />
+                      Web push
+                    </label>
+                    <button className="button button-primary" type="submit">
+                      Save reminders
+                    </button>
+                    {notificationChannels.includes("push") && (
+                      <button
+                        className="button button-secondary"
+                        onClick={() => void enablePushNotifications()}
+                        type="button"
+                      >
+                        Enable this device
+                      </button>
+                    )}
+                  </form>
+                  {!notificationSettings.pushEnabled && (
+                    <p className="feature-hint">
+                      Push requires the server’s VAPID keys. Email reminders
+                      work using the configured mail transport.
+                    </p>
+                  )}
+                  {reminders.length > 0 && (
+                    <ul className="reminder-history">
+                      {reminders.slice(0, 5).map((reminder) => (
+                        <li key={reminder.id}>
+                          {reminder.taskTitle} · {reminder.channel}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </>
+              ) : (
+                <p className="feature-hint">Loading reminder settings...</p>
+              )}
+            </details>
           </section>
 
           {(overdueCount > 0 || dueTodayCount > 0) && (
@@ -964,6 +2137,19 @@ export default function Home() {
                 Review tasks <span aria-hidden="true">→</span>
               </button>
             </section>
+          )}
+
+          {taskNotice && (
+            <p className="task-notice" role="status">
+              {taskNotice}
+              <button
+                aria-label="Dismiss message"
+                onClick={() => setTaskNotice("")}
+                type="button"
+              >
+                ×
+              </button>
+            </p>
           )}
 
           <section className="tasks-section">
@@ -1009,6 +2195,19 @@ export default function Home() {
               <details className="task-options">
                 <summary>Plan and organize this task</summary>
                 <div className="task-option-grid">
+                  {workspaceId && (
+                    <label>
+                      <span>Assign to</span>
+                      <select defaultValue="" name="assigneeId">
+                        <option value="">Unassigned</option>
+                        {workspaceMembers.map((member) => (
+                          <option key={member.userId} value={member.userId}>
+                            {member.username}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
                   <label>
                     <span>Due date</span>
                     <input aria-label="Due date" name="dueDate" type="date" />
@@ -1056,6 +2255,73 @@ export default function Home() {
                 </div>
               </details>
             </form>
+
+            {workspaceId && (
+              <p className="feature-hint">
+                New tasks will be visible to members of {selectedWorkspace?.name}.
+              </p>
+            )}
+
+            <div className="planner-heading">
+              <button
+                className="button button-secondary"
+                onClick={() => setWeekView((current) => !current)}
+                type="button"
+              >
+                {weekView ? "Hide week planner" : "Open week planner"}
+              </button>
+              {weekView && (
+                <div className="planner-navigation">
+                  <button
+                    aria-label="Previous week"
+                    onClick={() => setWeekOffset((current) => current - 1)}
+                    type="button"
+                  >
+                    ←
+                  </button>
+                  <span>
+                    {formatDueDate(weekDates[0])} – {formatDueDate(weekDates[6])}
+                  </span>
+                  <button
+                    aria-label="Next week"
+                    onClick={() => setWeekOffset((current) => current + 1)}
+                    type="button"
+                  >
+                    →
+                  </button>
+                </div>
+              )}
+            </div>
+            {weekView && (
+              <section className="week-planner" aria-label="Weekly task planner">
+                {weekDates.map((date) => (
+                  <article className="planner-day" key={date}>
+                    <h3>
+                      {new Intl.DateTimeFormat(undefined, {
+                        weekday: "short",
+                        month: "numeric",
+                        day: "numeric",
+                      }).format(new Date(`${date}T12:00:00`))}
+                    </h3>
+                    {tasks
+                      .filter((task) => task.dueDate === date)
+                      .map((task) => (
+                        <button
+                          className={`planner-task ${task.completed ? "planner-task-complete" : ""}`}
+                          key={task.id}
+                          onClick={() => setEditingTask(task)}
+                          type="button"
+                        >
+                          {task.title}
+                        </button>
+                      ))}
+                    {!tasks.some((task) => task.dueDate === date) && (
+                      <p className="planner-empty">No tasks</p>
+                    )}
+                  </article>
+                ))}
+              </section>
+            )}
 
             <div className="task-toolbar">
               <div className="filter-tabs" role="tablist" aria-label="Filter tasks">
@@ -1155,6 +2421,44 @@ export default function Home() {
                   </select>
                 </label>
               </div>
+            </div>
+
+            <div className="saved-view-row">
+              <label>
+                <span>Saved view</span>
+                <select
+                  onChange={(event) => applySavedView(event.target.value)}
+                  value={selectedSavedViewId}
+                >
+                  <option value="">Current filters</option>
+                  {savedViews.map((view) => (
+                    <option key={view.id} value={view.id}>
+                      {view.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                className="button button-secondary"
+                disabled={!selectedSavedViewId}
+                onClick={() => void deleteSavedView()}
+                type="button"
+              >
+                Delete view
+              </button>
+              <form className="save-view-form" onSubmit={saveCurrentView}>
+                <input
+                  aria-label="Saved view name"
+                  maxLength={40}
+                  onChange={(event) => setSavedViewName(event.target.value)}
+                  placeholder="Name these filters"
+                  required
+                  value={savedViewName}
+                />
+                <button className="button button-secondary" type="submit">
+                  Save view
+                </button>
+              </form>
             </div>
 
             {taskError && (
@@ -1270,6 +2574,12 @@ export default function Home() {
                       )}
                     </div>
 
+                    {weekView && task.dueDate && (
+                      <span className="sr-only">
+                        Due {formatDueDate(task.dueDate)}
+                      </span>
+                    )}
+
                     <details
                       className="subtask-details"
                       open={task.subtasks.length > 0}
@@ -1339,6 +2649,68 @@ export default function Home() {
                         </form>
                       </div>
                     </details>
+
+                    <button
+                      className="discussion-toggle"
+                      onClick={() => void toggleDiscussion(task.id)}
+                      type="button"
+                    >
+                      {discussionTaskId === task.id
+                        ? "Hide comments & activity"
+                        : "Comments & activity"}
+                    </button>
+                    {discussionTaskId === task.id && (
+                      <div className="discussion-panel">
+                        <section>
+                          <h3>Comments</h3>
+                          {taskComments.length ? (
+                            taskComments.map((comment) => (
+                              <article className="comment-item" key={comment.id}>
+                                <strong>{comment.username}</strong>
+                                <time dateTime={comment.createdAt}>
+                                  {new Intl.DateTimeFormat(undefined, {
+                                    dateStyle: "medium",
+                                    timeStyle: "short",
+                                  }).format(new Date(comment.createdAt))}
+                                </time>
+                                <p>{comment.content}</p>
+                              </article>
+                            ))
+                          ) : (
+                            <p className="feature-hint">No comments yet.</p>
+                          )}
+                          <form
+                            className="comment-form"
+                            onSubmit={(event) =>
+                              void addTaskComment(task.id, event)
+                            }
+                          >
+                            <input
+                              aria-label="Write a comment"
+                              maxLength={2000}
+                              onChange={(event) =>
+                                setCommentText(event.target.value)
+                              }
+                              placeholder="Write a comment..."
+                              required
+                              value={commentText}
+                            />
+                            <button className="button button-primary" type="submit">
+                              Comment
+                            </button>
+                          </form>
+                        </section>
+                        <section>
+                          <h3>Activity</h3>
+                          {taskActivity.map((activity) => (
+                            <p className="activity-item" key={activity.id}>
+                              <strong>{activity.username}</strong>{" "}
+                              {activity.action.replaceAll(".", " ")}
+                            </p>
+                          ))}
+                        </section>
+                      </div>
+                    )}
                   </article>
                 ))
               ) : (

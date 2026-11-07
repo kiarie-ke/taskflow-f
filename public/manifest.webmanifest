@@ -1,0 +1,17 @@
+{
+  "name": "Taskflow",
+  "short_name": "Taskflow",
+  "description": "A calmer way to organize your work.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#fffdf2",
+  "theme_color": "#1c241b",
+  "icons": [
+    {
+      "src": "/taskflow-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

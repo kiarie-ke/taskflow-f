@@ -13,6 +13,8 @@ export type Task = {
   description?: string;
   completed: boolean;
   ownerId: number;
+  workspaceId?: number;
+  assigneeId?: number;
   dueDate?: string;
   priority: TaskPriority;
   project?: string;
